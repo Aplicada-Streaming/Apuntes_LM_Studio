@@ -19,7 +19,8 @@
 8. [Integración con MCP](#8-integración-con-mcp-model-context-protocol)
 9. [Consumir el modelo local desde .NET](#9-consumir-el-modelo-local-desde-net)
 10. [Dockerizar / despliegue headless](#10-dockerizar--despliegue-headless)
-11. [Resumen y ruta de aprendizaje recomendada](#11-resumen-y-ruta-de-aprendizaje-recomendada)
+11. [Escenario de producción: modelo dockerizado con base de conocimiento y API para .NET](#11-escenario-de-producción-modelo-dockerizado-con-base-de-conocimiento-y-api-para-net)
+12. [Resumen y ruta de aprendizaje recomendada](#12-resumen-y-ruta-de-aprendizaje-recomendada)
 - [Anexo A — Tabla maestra de modelos de referencia](#anexo-a--tabla-maestra-de-modelos-de-referencia)
 - [Anexo B — Referencia de comandos `lms`](#anexo-b--referencia-de-comandos-lms)
 - [Anexo C — Referencia de endpoints de la API](#anexo-c--referencia-de-endpoints-de-la-api)
@@ -969,7 +970,648 @@ volumes:
 
 ---
 
-## 11. Resumen y ruta de aprendizaje recomendada
+## 11. Escenario de producción: modelo dockerizado con base de conocimiento y API para .NET
+
+> Esta sección une todo lo anterior en **un escenario de producción concreto y de punta a punta**: el modelo corriendo en un contenedor, su **base de conocimiento (RAG)** persistida en un vector store, y una **API OpenAI-compatible** que tu app .NET consume. Reusa lo ya visto — el runtime dockerizado de la [§10](#10-dockerizar--despliegue-headless), la cadena RAG de la [§7](#7-agregar-una-base-de-conocimiento-rag) y el cliente .NET de la [§9](#9-consumir-el-modelo-local-desde-net) — y agrega el "pegamento" que faltaba: arquitectura, generación de la imagen, configuración del contenedor según el modelo, preparación de la KB y dimensionamiento de usuarios. **El código .NET de la [§9](#9-consumir-el-modelo-local-desde-net) no cambia**: sigue siendo una API OpenAI-compatible; solo cambian el `Endpoint` y la infraestructura que la rodea.
+
+### 11.1 Arquitectura del stack
+
+La idea es separar responsabilidades en contenedores distintos, cada uno con su ciclo de vida y sus recursos. Una consulta RAG fluye así:
+
+```
+                                   ┌─────────────────────────────────────────────┐
+                                   │                  Docker network              │
+  ┌──────────────┐                 │   ┌───────────────────────────────────────┐ │
+  │  Cliente      │   HTTP/JSON     │   │  runtime del modelo (CONTENEDOR 1)    │ │
+  │  .NET (§9)    │────────────────►│   │  llmster + lms  (o llama-server /     │ │
+  │  IChatClient  │  /v1/chat/...   │   │  ollama en el camino GPU)             │ │
+  │  IEmbeddingGen│◄────────────────│   │  expone OpenAI-compat :1234           │ │
+  └──────┬───────┘    (opcional)    │   │  /v1/chat/completions /v1/embeddings  │ │
+         │            reverse proxy │   └──────────────┬────────────────────────┘ │
+         │            (nginx/Caddy/ │                  │ embeddings                │
+         │             Traefik):    │                  ▼                           │
+         │            TLS + API key │   ┌───────────────────────────────────────┐ │
+         │            + rate-limit  │   │  vector store (CONTENEDOR 2)          │ │
+         │                          │   │  Qdrant / Postgres+pgvector           │ │
+         └─────────────────────────┘   │  guarda y busca por similitud         │ │
+                                        └──────────────┬────────────────────────┘ │
+                                                       ▲ upsert de vectores        │
+                                        ┌──────────────┴────────────────────────┐ │
+                                        │  servicio de ingesta (CONTENEDOR 3)   │ │
+                                        │  job/worker .NET: lee docs → chunking │ │
+                                        │  → POST /v1/embeddings → upsert store │ │
+                                        └───────────────────────────────────────┘ │
+                                        (volúmenes: modelos / datos del store)     │
+                                   └─────────────────────────────────────────────┘
+```
+
+Qué corre en cada contenedor:
+
+| Contenedor | Qué corre | Puerto | Volumen | Notas |
+|---|---|---|---|---|
+| **Runtime del modelo** | `llmster` + `lms` (camino A) **o** `llama-server`/`ollama` (camino B). Expone la API OpenAI-compatible. | `1234` (LM Studio), `8080` (llama-server), `11434` (ollama) | modelos (`/root/.lmstudio`) | Es el que consume CPU/GPU/RAM. **Single-user** en el caso LM Studio (ver caveats en §11.2). |
+| **Vector store** | Base vectorial (Qdrant, Postgres+pgvector, etc.). | según motor | datos del índice | Persistente. Sobrevive a reinicios del runtime. |
+| **Servicio de ingesta** | Worker/job .NET que indexa documentos: chunking → embeddings (vía el runtime) → upsert al store. | — | docs de entrada | Se ejecuta **una vez** por lote de docs (o por cron), no de forma continua. |
+| **Reverse proxy** *(opcional pero recomendado al exponer)* | nginx / Caddy / Traefik. | `443` | certificados | Pone TLS, **autenticación** y rate-limiting **delante** del runtime, que no trae nada de eso por defecto. |
+
+Flujo de una consulta del usuario (fase de **consulta**, no de indexación):
+
+1. El cliente .NET arma la pregunta y pide su **embedding** al runtime (`POST /v1/embeddings`).
+2. Con ese vector, consulta el **vector store** los top-K chunks más parecidos.
+3. Inyecta esos chunks como contexto y llama `POST /v1/chat/completions` contra el **mismo runtime**.
+4. El runtime infiere y devuelve la respuesta (con streaming si querés). Si hay reverse proxy, todo pasa por él (TLS + `Authorization: Bearer`).
+
+> La **indexación** (leer docs, partir en chunks, embeddings, upsert) la hace el **contenedor de ingesta** por separado, no en el camino de la request del usuario. Ver la cadena RAG en la [§7](#7-agregar-una-base-de-conocimiento-rag).
+
+### 11.2 Dos caminos para el runtime del modelo
+
+No hay una sola respuesta: depende de si tenés **GPU** y de cuánta madurez/concurrencia necesitás. Los dos caminos exponen API OpenAI-compatible, así que **tu .NET es el mismo** (solo cambia `Endpoint` y el puerto).
+
+#### (A) Camino LM Studio nativo — `lmstudio/llmster-preview:cpu`
+
+Útil para **CPU**, **CI** y **previews**. Es lo que ya describimos en la [§10](#10-dockerizar--despliegue-headless): imagen ~370 MB, x86/amd64, puerto 1234, `lms` preinstalado, persistencia en `/root/.lmstudio`.
+
+> ⚠️ **Caveats explícitos (no los tapes):**
+> - Es **Technical Preview** y **CPU-only**: sin aceleración GPU, la inferencia de modelos medianos/grandes es lenta.
+> - **Solo x86 (amd64)** — no hay ARM64 en el preview.
+> - El server de LM Studio está pensado como **single-user / un proceso a la vez**; no es un servidor multiusuario concurrente.
+> - La página del preview no se actualiza hace meses. **No la tomes como base de producción tal cual.**
+> - Ideal para: validar tu integración .NET, pipelines de CI sin GPU, demos reproducibles, o entornos donde justamente no querés GPU.
+
+#### (B) Camino producción con GPU — `llama-server` (llama.cpp) u Ollama
+
+Cuando necesitás **GPU real en contenedor**, hoy conviene un runtime con imagen **CUDA madura**:
+
+- **`ghcr.io/ggml-org/llama.cpp:server-cuda`** — el mismo `llama-server` compilado con CUDA 12 (hay tag `server-cuda13` para CUDA 13). Corre el **mismo motor llama.cpp / GGUF** que usa LM Studio por debajo, pero con build GPU oficial. Puerto 8080.
+- **`ollama/ollama`** — runtime con gestión de modelos cómoda (`ollama pull`), imagen oficial con soporte NVIDIA. Puerto 11434.
+
+Ambos exponen **OpenAI-compatible** (`/v1/chat/completions`, `/v1/embeddings`), así que **el código .NET de la [§9](#9-consumir-el-modelo-local-desde-net) no cambia**: solo apuntás `Endpoint` a `http://<host>:8080/v1` o `http://<host>:11434/v1`. Requieren **NVIDIA Container Toolkit** instalado en el host y `--gpus all` en el `docker run`.
+
+| Criterio | **LM Studio / llmster** | **Ollama** | **llama-server (llama.cpp)** |
+|---|---|---|---|
+| **GPU en contenedor** | ❌ imagen oficial CPU-only (preview) | ✅ imagen CUDA oficial (`--gpus all`) | ✅ imagen CUDA oficial (`server-cuda`, `-ngl 99`) |
+| **Concurrencia / batching** | Single-user, un proceso a la vez | Cola de requests; varios modelos | **Batching real** (`--parallel`, *continuous batching*) |
+| **Madurez para prod** | Preview, experimental | Madura, muy usada | Madura, es el motor base de todos |
+| **OpenAI-compat** | ✅ (+ Anthropic + REST nativa) | ✅ | ✅ |
+| **Gestión de modelos** | `lms get/load`, GUI para descubrir | `ollama pull` (registry propio) | Manual (descargás el GGUF vos) |
+| **Cuándo elegirlo** | Dev local, CI/CPU, demos, o cuando salga de preview | Producción con GPU y operación simple, multimodelo | Producción con GPU exigente: máximo control de batching, contexto y rendimiento |
+
+> **Regla práctica:** para *desarrollar* y *consumir desde .NET*, LM Studio. Para *producción dockerizada con GPU*, hoy **Ollama** (operación simple) o **llama-server** (máximo rendimiento/control). Como los tres son OpenAI-compatible, podés desarrollar contra LM Studio y desplegar contra Ollama/llama-server sin tocar la lógica de tu app.
+
+### 11.3 Generar la imagen Docker (camino A)
+
+#### `docker run` básico contra la imagen oficial
+
+```bash
+docker run -d --name llmster \
+  -p 1234:1234 \
+  -v lmstudio-models:/root/.lmstudio \
+  lmstudio/llmster-preview:cpu
+```
+
+Después le decís a la CLI que descargue y cargue el modelo **apuntando al contenedor**:
+
+```bash
+lms get  qwen3-8b --host localhost --port 1234
+lms load qwen3-8b --host localhost --port 1234 --context-length=8192 --ttl=3600
+```
+
+El problema de esto: cada vez que recreás el contenedor, **volvés a cargar el modelo a mano**. Para producción querés que **arranque ya listo**.
+
+#### Dockerfile que extiende la base y pre-carga el modelo
+
+El patrón es: extender `lmstudio/llmster-preview:cpu`, definir qué modelos querés (chat + embeddings), y un **entrypoint** que levanta el server y carga el modelo al arrancar.
+
+```dockerfile
+# Dockerfile
+FROM lmstudio/llmster-preview:cpu
+
+# Modelos que va a usar este contenedor (chat + embeddings para RAG)
+ENV CHAT_MODEL="qwen3-8b" \
+    EMBED_MODEL="nomic-embed-text-v1.5" \
+    CONTEXT_LENGTH="8192" \
+    TTL="0"
+
+# --- OPCIÓN 1: bakear los modelos EN la imagen (build) ---
+# Los descarga durante el build; la imagen queda autocontenida pero PESADA.
+RUN lms get ${CHAT_MODEL} && lms get ${EMBED_MODEL}
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+EXPOSE 1234
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=5 \
+  CMD curl -fsS http://localhost:1234/v1/models || exit 1
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+```
+
+```bash
+# entrypoint.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 1) Levantar la API (en background) con CORS habilitado
+lms server start --port 1234 --cors &
+
+# 2) Esperar a que el server responda
+until curl -fsS http://localhost:1234/v1/models >/dev/null 2>&1; do
+  echo "esperando al server de LM Studio..."; sleep 2
+done
+
+# 3) Si los modelos NO están bakeados (volumen montado), descargarlos ahora
+lms get "${CHAT_MODEL}"  || true
+lms get "${EMBED_MODEL}" || true
+
+# 4) Cargar a memoria con la config del contenedor
+#    --gpu=0 porque la imagen oficial es CPU-only; --ttl=0 = sin auto-unload
+lms load "${CHAT_MODEL}"  --gpu=0 --context-length="${CONTEXT_LENGTH}" --ttl="${TTL}"
+lms load "${EMBED_MODEL}" --gpu=0 --ttl="${TTL}"
+
+echo "runtime listo: ${CHAT_MODEL} + ${EMBED_MODEL}"
+
+# 5) Mantener el contenedor vivo siguiendo al proceso del server
+wait
+```
+
+> 💡 **Antes de cargar**, validá memoria sin gastarla: `lms load <modelo> --estimate-only` te previsualiza los requisitos. Útil en el build/CI para fallar temprano si el modelo no entra.
+
+#### "Modelo bakeado en la imagen" vs "modelo en volumen montado"
+
+| Patrón | Cómo | Ventaja | Trade-off |
+|---|---|---|---|
+| **Bakeado (en el build)** | `RUN lms get ...` en el Dockerfile | Imagen **autocontenida**: arranca offline, despliegue reproducible (mismo digest = mismo modelo). | Imagen **enorme** (varios GB) y lenta de pushear/pullear; cambiar de modelo = rebuild. |
+| **En volumen montado** | `-v lmstudio-models:/root/.lmstudio` + `lms get` en el entrypoint | Imagen **chica**; el modelo se descarga una vez y se **reusa en caché** entre contenedores/recreaciones; cambiás de modelo sin rebuild. | Primer arranque **descarga** (necesita red); hay que gestionar/persistir el volumen. |
+
+> **Recomendación:** para **CI/efímero/air-gapped**, bakeá. Para **servidores estables** donde varios contenedores comparten cache de modelos, **volumen montado**. Híbrido común: imagen chica + volumen, y un *warm-up job* que hace `lms get` una vez antes de poner el servicio en rotación.
+
+### 11.4 Configurar el contenedor para el modelo adecuado
+
+Estos son los parámetros que definen **qué modelo corre y cómo**. La mayoría se setea con flags de `lms load` (dentro del entrypoint) y con opciones de Docker (memoria/CPU/GPU).
+
+| Parámetro | Dónde se setea | Para qué sirve | Recomendación |
+|---|---|---|---|
+| **Límite de RAM** | `--memory` (run) / `mem_limit` (compose) | Techo de RAM del contenedor. Si el modelo + KV-cache lo superan, el OOM-killer lo mata. | RAM del modelo (Q4_K_M) + headroom de contexto + ~2 GB. |
+| **CPUs** | `--cpus` / `cpus:` | Núcleos disponibles para inferencia CPU. | Cuantos más, mejor throughput en CPU-only. |
+| **GPU** | `--gpus all` (run) | Pasa la GPU al contenedor (**solo camino B**, requiere NVIDIA Container Toolkit). | En camino A es inútil (imagen CPU-only). |
+| **`--gpu=max\|auto\|0.0-1.0`** | flag de `lms load` | Fracción del modelo en GPU. `max` = todo lo posible; `0` = CPU puro. | Camino A: `--gpu=0`. Camino B (con `llmster` GPU): `--gpu=max`. |
+| **`--context-length`** | flag de `lms load` | Ventana de contexto del modelo cargado. Más contexto = más KV-cache = más RAM. | `8192` razonable en CPU; subí solo si tu caso lo pide. |
+| **`--ttl`** | flag de `lms load` | *Keep-alive*: segundos de inactividad antes de descargar el modelo. | `--ttl=0` en producción = **siempre cargado** (sin cold-start por request). |
+| **`--cors`** | flag de `lms server start` | Habilita CORS (si lo llama un navegador/SPA). | Activalo si hay frontend web directo. |
+| **Variables de entorno** | `-e` / `environment:` | Inyectar `CHAT_MODEL`, `EMBED_MODEL`, etc. al entrypoint. | Parametrizá el modelo por env, no lo hardcodees en la imagen. |
+| **Volumen de modelos** | `-v vol:/root/.lmstudio` | Persistir descargas entre recreaciones. | Siempre, salvo que bakees todo. |
+| **Healthcheck** | `HEALTHCHECK` / `healthcheck:` | `curl` a `/v1/models`: marca *healthy* cuando la API responde. | `start-period` largo (≥120s): cargar el modelo tarda. |
+
+Ejemplo de `docker-compose.yml` (camino A, CPU-only, con el vector store del RAG; el esquema y el *seed* del store se detallan en §11.5):
+
+```yaml
+services:
+  llmster:
+    build: .                       # usa el Dockerfile de §11.3
+    image: mi-llmster:qwen3-8b
+    ports:
+      - "1234:1234"
+    environment:
+      CHAT_MODEL: "qwen3-8b"
+      EMBED_MODEL: "nomic-embed-text-v1.5"
+      CONTEXT_LENGTH: "8192"
+      TTL: "0"
+    mem_limit: 12g                 # 8B Q4_K_M (~5 GB) + KV-cache + headroom
+    cpus: "6.0"
+    volumes:
+      - lmstudio-models:/root/.lmstudio
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:1234/v1/models"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 5
+    restart: unless-stopped
+
+  qdrant:                          # vector store del RAG (esquema/seed en §11.5)
+    image: qdrant/qdrant
+    ports:
+      - "6333:6333"                # REST / dashboard
+      - "6334:6334"                # gRPC (upserts masivos del ingestor)
+    volumes:
+      - qdrant-data:/qdrant/storage         # la KB persiste acá
+      - ./seed/snapshots:/qdrant/snapshots  # patrón "seed" (§11.5)
+    restart: unless-stopped
+
+  # ingestor: job de indexación (one-shot). Se corre con
+  # `docker compose run --rm ingestor` cuando cambian los docs. Ver §11.5.
+
+volumes:
+  lmstudio-models:
+  qdrant-data:
+```
+
+Y el bloque que **agregás** al servicio del runtime en el **camino B con GPU** (con `llama-server`, no LM Studio):
+
+```yaml
+  llama-server:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    command: >
+      -m /models/qwen3-30b-a3b-q4_k_m.gguf
+      --host 0.0.0.0 --port 8080
+      --n-gpu-layers 99 --ctx-size 16384 --parallel 4
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # equivalente en `docker run`: --gpus all
+```
+
+**Recomendación concreta de modelo + cuantización + contexto** (apoyada en la [§4](#4-cómo-elegir-el-modelo-según-el-hardware) y el [Anexo A](#anexo-a--tabla-maestra-de-modelos-de-referencia)):
+
+| Escenario | Modelo de chat | Cuant. | Context | Embeddings | RAM/VRAM aprox. | Por qué |
+|---|---|---|---|---|---|---|
+| **CPU-only modesto** (≤16 GB) | **Qwen3 8B** | Q4_K_M | 8192 | nomic-embed-text-v1.5 | ~5 GB + ctx | Tool calling fuerte, entra holgado, lento pero usable en CPU. |
+| **CPU-only con RAM** (32 GB) | **gpt-oss-20b** (MoE) o **Qwen3 30B-A3B** (MoE) | Q4_K_M | 8192 | nomic-embed-text-v1.5 | ~12–18 GB + ctx | Los MoE **activan pocos parámetros por token** → rinden como uno chico en velocidad. Ideal para CPU. |
+| **GPU producción** (24 GB VRAM) | **Qwen3 30B-A3B** (MoE) o **Qwen3 32B** | Q4_K_M | 16384 | nomic-embed-text-v1.5 / bge-m3 | ~18–19 GB + ctx | Con `llama-server`/Ollama y `--gpus all`, contexto más largo y batching real. |
+
+> En CPU-only, los **MoE** (gpt-oss-20b, Qwen3 30B-A3B) son la jugada inteligente: tenés el conocimiento de un modelo grande con la velocidad de uno chico. Para chatbots con **herramientas/MCP**, priorizá *instruct* con buen tool calling (gpt-oss, Qwen3, Llama 3.x).
+
+### 11.5 La base de conocimiento (RAG) en producción
+
+Hasta acá la base de conocimiento la armábamos "a mano" desde la GUI ([§7](#7-agregar-una-base-de-conocimiento-rag)) o con una `List` en memoria desde .NET ([§9.7](#97--rag-propio-completo-desde-net)). Eso sirve para entender y prototipar, pero **no sobrevive a un reinicio del contenedor ni escala**. En un despliegue dockerizado, la KB deja de ser una variable en RAM y pasa a ser **un servicio más del stack**: un vector store persistente, poblado por un proceso de ingesta separado.
+
+> **Idea central que NO hay que perder de vista:** el modelo de chat **nunca "aprende" tus documentos**. No hay fine-tuning ni reentrenamiento. La base de conocimiento vive **íntegramente en el vector store**; el LLM solo recibe, en cada pregunta, los fragmentos relevantes pegados en el prompt. Cambiar de modelo de chat no te hace perder la KB; borrar el volumen del vector store, sí.
+
+#### Las dos fases en un despliegue real
+
+En la GUI las dos fases de RAG ([§7](#7-agregar-una-base-de-conocimiento-rag)) ocurren juntas y ocultas. En producción se **separan físicamente** en dos procesos con ciclos de vida distintos:
+
+| Fase | Cuándo corre | Quién la ejecuta | Qué hace |
+|---|---|---|---|
+| **Ingesta / indexación** | **Offline.** Una vez, o cada vez que cambian los documentos. | Un contenedor **"ingestor"** (job batch, no expuesto). | Lee docs → chunking → pide embeddings al runtime → **persiste** en el vector store. |
+| **Consulta** | **Online, en caliente.** En cada request del usuario. | La **API .NET** (servicio long-running). | Embeddea la pregunta → recupera top-K → arma prompt con contexto → llama al chat model. |
+
+**Fase de ingesta (el contenedor "ingestor").** Es un proceso que arranca, hace su trabajo y **termina** (no es un servidor). Su pipeline:
+
+```text
+documentos (PDF/MD/TXT en un volumen o bucket)
+   → parser (extrae texto plano)
+   → chunking (≈500 tokens, overlap ≈100)
+   → POST /v1/embeddings  (model = nomic-embed-text-v1.5)   ← contra el runtime
+   → upsert en el vector store  (vector + texto + metadata de la fuente)
+```
+
+Clave: el ingestor le pega al **mismo `/v1/embeddings`** que usa la fase de consulta (mismo modelo, misma dimensión — si no, los vectores no son comparables). El runtime (llmster/Ollama/llama-server, ver [§10](#10-dockerizar--despliegue-headless)) tiene que tener el **embeddings model cargado** antes de correr el ingestor.
+
+**Fase de consulta (la API .NET).** Es exactamente la cadena de la [§9.7](#97--rag-propio-completo-desde-net) / [§9.8](#98--chatbot-con-historial-en-aspnet-core), pero con el store en memoria reemplazado por el conector del vector store real. No la repetimos acá: el código de embeddear la pregunta, recuperar top-K y armar el prompt es **idéntico**; solo cambia de dónde salen los chunks (de `IVectorStore` en vez de una `List`).
+
+> En criollo: **el ingestor escribe la KB; la API la lee.** Pueden escalar por separado (la API a N réplicas; el ingestor corre cuando hace falta) y comparten un único punto de verdad: el vector store.
+
+#### Elección y operación del vector store en contenedor
+
+| Vector store | Dockerizar | Escala | Cuándo usarlo |
+|---|---|---|---|
+| **SQLite + sqlite-vec** | Trivial (es un archivo, no hay servicio). | Baja-media. Single-node, sin concurrencia de escritura. | KB chica/embebida, una sola instancia de API, demos, edge. |
+| **Postgres + pgvector** | Fácil (imagen `pgvector/pgvector`). Si ya tenés Postgres, es **un `CREATE EXTENSION`**. | Media-alta. Transaccional, joins con tus datos relacionales. | Cuando ya usás Postgres y querés la KB **junto** a tus datos de negocio. Índices `hnsw` o `ivfflat`. |
+| **Qdrant** | Fácil (imagen `qdrant/qdrant`, sin tuning). | Alta. Diseñado para vectores, HNSW nativo, filtros por metadata rápidos, **snapshots**. | KB grande, filtrado pesado por metadata, o cuando el RAG es el caso de uso principal. |
+
+> **Recomendación por defecto para este escenario:** **Qdrant** si la KB es el corazón del sistema (HNSW nativo, snapshots para seed, escala sin dolor), o **Postgres + pgvector** si ya tenés Postgres en el stack (un servicio menos que operar). Para una KB chica de una sola instancia, **SQLite + sqlite-vec** es lo más simple. Los tres tienen conector para **`Microsoft.Extensions.VectorData`**, así que el código .NET cambia poco entre ellos.
+
+**El servicio del vector store ya está en el `docker-compose` de §11.4** (el contenedor `qdrant`, con su volumen `qdrant-data` para `/qdrant/storage` y el bind de `snapshots` para el patrón *seed*). Si preferís **Postgres + pgvector** en vez de Qdrant, reemplazá ese servicio por:
+
+```yaml
+services:
+  pgvector:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: kb
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./seed/initdb:/docker-entrypoint-initdb.d  # *.sql de seed corren al primer arranque
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+```
+
+**Esquema de la colección / tabla.** Los campos mínimos son los mismos en cualquier store:
+
+| Campo | Tipo | Para qué |
+|---|---|---|
+| `id` | UUID / int | Clave única del chunk. |
+| `text` | texto | El contenido del chunk (lo que se inyecta en el prompt). |
+| `embedding` / `vector` | vector(768) | El embedding del chunk (dimensión de nomic-embed-text-v1.5). |
+| `source` | texto | Archivo/URL de origen (para citar la fuente en la respuesta). |
+| `chunk_index` / `page` | int | Posición dentro del documento (trazabilidad). |
+| `metadata` | json | Extra: sección, fecha, versión del doc, tags para filtrar. |
+
+En **pgvector** eso es una tabla con índice vectorial:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE kb_chunks (
+    id          BIGSERIAL PRIMARY KEY,
+    text        TEXT        NOT NULL,
+    embedding   vector(768) NOT NULL,          -- 768 = nomic-embed-text-v1.5
+    source      TEXT,
+    chunk_index INT,
+    metadata    JSONB
+);
+
+-- Índice HNSW con métrica coseno (vector_cosine_ops):
+CREATE INDEX ON kb_chunks USING hnsw (embedding vector_cosine_ops);
+```
+
+En **Qdrant**, la colección equivalente:
+
+```bash
+curl -X PUT http://localhost:6333/collections/kb_chunks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vectors": { "size": 768, "distance": "Cosine" }
+  }'
+# id, text, source, chunk_index y metadata van en el "payload" de cada punto.
+```
+
+#### Persistencia, versionado y KB pre-cargada (seed)
+
+**Cómo persiste.** La KB vive en el **volumen del vector store** (`qdrant-data` o `pg-data`). Mientras el volumen exista, la KB sobrevive a reinicios, actualizaciones de imagen y recreación del contenedor. **Sin volumen, la KB se evapora en cada `docker compose down`** — el error clásico.
+
+**Cómo se versiona / re-indexa.** La KB es un derivado de tus documentos + el modelo de embeddings. Reglas:
+
+- Si **cambian los documentos**: corré el ingestor de nuevo. Hacé **upsert por `id` estable** (p. ej. hash del archivo + `chunk_index`) para no duplicar; borrá los chunks de las fuentes que desaparecieron.
+- Si **cambiás el modelo de embeddings** (o su dimensión): hay que **re-indexar todo**. Vectores de modelos distintos no son comparables. Estrategia segura: indexar en una **colección/tabla nueva** (`kb_chunks_v2`) y hacer el switch atómico cuando termina.
+- Versioná la KB con un campo `kb_version` en metadata o en el nombre de la colección, así podés rollbackear.
+
+**Patrón "KB pre-cargada / seed".** Para que el stack levante con la base **ya poblada** (sin esperar a que corra el ingestor), embebés un snapshot/dump y lo restaurás al primer arranque:
+
+- **Qdrant — snapshot.** Generás un snapshot de la colección ya indexada y lo montás. Al levantar, restaurás:
+
+  ```bash
+  # 1) Generar snapshot (en el entorno donde ya indexaste)
+  curl -X POST http://localhost:6333/collections/kb_chunks/snapshots
+
+  # 2) Lo dejás en ./seed/snapshots (montado en /qdrant/snapshots) y restaurás al arrancar:
+  curl -X PUT \
+    "http://localhost:6333/collections/kb_chunks/snapshots/recover" \
+    -H "Content-Type: application/json" \
+    -d '{ "location": "file:///qdrant/snapshots/kb_chunks.snapshot" }'
+  ```
+
+- **pgvector — dump SQL.** Dejás un `pg_dump` (o un `.sql` con los `INSERT`) en `/docker-entrypoint-initdb.d`: Postgres lo ejecuta automáticamente **solo en el primer arranque** (cuando el volumen está vacío). Útil para CI y para arrancar entornos nuevos con la KB lista.
+
+> El seed te da arranques **reproducibles y rápidos**: el contenedor levanta con la KB del último build, sin depender del runtime de embeddings ni de los documentos fuente en ese momento. La ingesta incremental queda para las actualizaciones.
+
+#### Dimensiones y parámetros prácticos
+
+`nomic-embed-text-v1.5` produce vectores de **768 dimensiones** (está entrenado con *Matryoshka Representation Learning*, así que se puede **truncar** a 512/256/128/64 para ahorrar memoria con poca pérdida — pero si truncás, **declará la dimensión truncada en el esquema** y aplicala consistente en ingesta y consulta). Soporta hasta **8192 tokens** de contexto por entrada, así que un chunk de ~500 tokens le sobra.
+
+| Parámetro | Valor recomendado | Por qué |
+|---|---|---|
+| **Modelo de embeddings** | `nomic-embed-text-v1.5` | Liviano, CPU-friendly, OpenAI-compatible vía `/v1/embeddings`. |
+| **Dimensión del vector** | **768** (truncable a 512/256/…) | Default del modelo; la columna/colección se define con este tamaño. |
+| **Métrica de distancia** | **Coseno** | Estándar para embeddings de texto; insensible a la magnitud. |
+| **Índice** | **HNSW** (Qdrant nativo, pgvector `hnsw`) | Mejor recall/latencia en consulta. `ivfflat` (pgvector) si la KB es enorme y priorizás memoria/tiempo de build. |
+| **Tamaño de chunk** | **~500 tokens** | Equilibrio entre precisión de recuperación y contexto suficiente. |
+| **Overlap** | **~100 tokens** | Evita cortar ideas justo en el borde de dos chunks. |
+| **Top-K** | **4–8** | Suficiente contexto sin saturar la ventana del chat model ni meter ruido. |
+
+> Nota sobre nomic: el modelo usa **prefijos de tarea** (`search_document:` al indexar, `search_query:` al consultar). Si tu cliente/conector no los agrega solo, prependelos vos en ingesta y en consulta — mejora la calidad de la recuperación.
+
+#### Pseudocódigo del flujo de ingesta
+
+```text
+ENTRADA: carpeta/volumen con documentos, runtime con embeddings model cargado,
+         vector store levantado y colección creada (size=768, Cosine)
+
+para cada documento en la fuente:
+    texto   = extraerTexto(documento)              # parser PDF/MD/TXT
+    chunks  = partir(texto, tamaño=500, overlap=100)
+    lote    = []
+    para cada (i, chunk) en chunks:
+        # search_document: => prefijo de tarea de nomic al indexar
+        vec = POST /v1/embeddings(model="nomic-embed-text-v1.5",
+                                  input="search_document: " + chunk)   # 768 dims
+        id  = hash(documento.ruta) + ":" + i        # id estable => upsert idempotente
+        lote.añadir({ id, text: chunk, embedding: vec,
+                      source: documento.ruta, chunk_index: i, metadata: {...} })
+    vectorStore.UPSERT(lote)                         # idempotente: re-correr no duplica
+
+al terminar:
+    borrar del store los chunks cuya 'source' ya no existe   # limpieza de docs eliminados
+    (opcional) generar snapshot/dump => artefacto de "seed"
+SALIDA: el ingestor TERMINA (no es un servidor)
+```
+
+Del lado .NET, el ingestor usa **`Microsoft.Extensions.VectorData`** (`IVectorStore`) + el `IEmbeddingGenerator` de la [§9.5](#95--microsoftextensionsai-la-abstracción-recomendada) — no la `List` en memoria de la [§9.7](#97--rag-propio-completo-desde-net). Fragmento del lado ingesta (el modelo del registro + el upsert; la generación de embeddings y el chunking son la misma cadena de la §7/§9.7):
+
+```csharp
+// dotnet add package Microsoft.Extensions.VectorData.Abstractions
+// dotnet add package <conector>   (Qdrant.Client / Npgsql + pgvector / sqlite-vec)
+using Microsoft.Extensions.VectorData;
+
+// 1) El registro mapea 1:1 al esquema de la tabla/colección
+sealed class KbChunk
+{
+    [VectorStoreKey]                                   public ulong Id { get; set; }
+    [VectorStoreData]                                  public string Text { get; set; } = "";
+    [VectorStoreData(IsIndexed = true)]                public string Source { get; set; } = "";
+    [VectorStoreData]                                  public int ChunkIndex { get; set; }
+    [VectorStoreVector(768, DistanceFunction = DistanceFunction.CosineSimilarity)]
+    public ReadOnlyMemory<float> Embedding { get; set; }   // 768 = nomic-embed-text-v1.5
+}
+
+// 2) collection viene del conector (Qdrant/pgvector); embedder es el IEmbeddingGenerator de §9.5
+await collection.EnsureCollectionExistsAsync();
+
+foreach (var (chunk, i) in Chunk(text, size: 500, overlap: 100).Select((c, i) => (c, i)))
+{
+    var vec = await embedder.GenerateAsync($"search_document: {chunk}");   // prefijo nomic
+    await collection.UpsertAsync(new KbChunk
+    {
+        Id = StableId(path, i),          // id estable => idempotente, no duplica al re-indexar
+        Text = chunk, Source = path, ChunkIndex = i,
+        Embedding = vec.Vector
+    });
+}
+```
+
+> La fase de **consulta** usa el mismo `collection` con `collection.SearchAsync(queryVector, top: K)` y de ahí en más es la cadena de la [§9.7](#97--rag-propio-completo-desde-net)/[§9.8](#98--chatbot-con-historial-en-aspnet-core) (armar prompt con el contexto + `IChatClient`). Recordá el prefijo `search_query:` al embeddear la pregunta.
+
+#### Preparar la KB de punta a punta
+
+1. **Cargá el embeddings model en el runtime.** Contra el contenedor del runtime ([§10](#10-dockerizar--despliegue-headless)): `lms get nomic-embed-text-v1.5 --host <runtime> --port 1234` y `lms load nomic-embed-text-v1.5 --host <runtime> --port 1234`. Verificá con `GET /v1/models` que aparezca. Puede convivir con el chat model en el mismo runtime, o ir en un runtime separado.
+2. **Levantá el vector store y creá la colección/tabla.** `docker compose up -d qdrant` (o `pgvector`), luego creá la colección `kb_chunks` con `size=768`, `Cosine` e índice HNSW (curl o el `EnsureCollectionExistsAsync()` del ingestor).
+3. **Corré el contenedor ingestor.** Apunta sus documentos (volumen/bucket), el `/v1/embeddings` del runtime y el vector store. Hace chunking → embeddings → upsert y **termina**. (Es un job batch, no un servicio.)
+4. **Verificá el vector store.** Que la colección tenga puntos: en Qdrant `GET /collections/kb_chunks` (mirá `points_count`); en pgvector `SELECT count(*) FROM kb_chunks;`. Probá una búsqueda con un embedding de prueba y revisá que los top-K tengan sentido.
+5. **(Opcional) Generá el snapshot/dump de seed.** Para que entornos nuevos arranquen con la KB ya poblada (snapshot de Qdrant o `pg_dump`).
+6. **Conectá la API .NET.** Configurá en `appsettings.json` el endpoint del vector store y el `EmbeddingModel` (ya está en la config de la [§9.4](#94--configuración-e-inyección-de-dependencias-base-de-una-app-real)), registrá el `IVectorStore` y el `IEmbeddingGenerator` en DI, y levantá la API. A partir de acá la fase de consulta es la cadena de la [§9.7](#97--rag-propio-completo-desde-net)/[§9.8](#98--chatbot-con-historial-en-aspnet-core).
+
+> **Regla de oro de operación:** el ingestor y la API **comparten el modelo de embeddings y la dimensión**. Si cambiás uno, re-indexás. La KB es persistente y versionable; el chat model es intercambiable y no guarda nada.
+
+*Fuentes: [nomic-embed-text-v1.5 (Hugging Face)](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5), [Nomic Embed Matryoshka](https://www.nomic.ai/news/nomic-embed-matryoshka), [LM Studio — text embeddings](https://lmstudio.ai/docs/text-embeddings), [Qdrant — instalación y Docker](https://qdrant.tech/documentation/guides/installation/), [Qdrant — snapshots](https://qdrant.tech/documentation/concepts/snapshots/), [pgvector](https://github.com/pgvector/pgvector), [Microsoft.Extensions.VectorData](https://learn.microsoft.com/en-us/dotnet/ai/microsoft-extensions-vector-data), [sqlite-vec](https://github.com/asg017/sqlite-vec).*
+
+### 11.6 Capacity planning: ¿cuántos usuarios aguanta?
+
+Antes de meter LM Studio en un escenario de producción tenés que poder responder dos preguntas con números (aunque sean aproximados): **¿cuánto tarda una consulta?** y **¿cuántas consultas en paralelo aguanto?** Esta parte te da el modelo mental, los supuestos y unas tablas para dimensionar.
+
+> ⚠️ **El elefante en la habitación:** como vimos en la [§6](#6-el-servidor-de-api-local), el servidor de LM Studio está pensado como **single-user / un proceso a la vez**. No está documentado como servidor multiusuario concurrente: por defecto **procesa las requests en serie**. O sea, si te entran 10 requests juntas, la 10ma espera a que terminen las 9 anteriores. **La "concurrencia real" de una sola instancia de LM Studio es ≈ 1.** Todo lo que sigue parte de esa verdad incómoda: para subir concurrencia necesitás **poner una cola adelante**, **levantar varias réplicas** o **migrar a un motor con batching** (llama.cpp server, vLLM, Ollama). Lo desarrollamos abajo.
+
+#### Modelo mental del cálculo
+
+La latencia de **una** consulta se descompone en dos tiempos:
+
+```
+latencia ≈ time_to_first_token (TTFT)  +  (tokens_de_salida ÷ tokens_por_segundo)
+            └── procesar el prompt ──┘     └──────── generación ────────┘
+```
+
+- **TTFT (time-to-first-token):** lo que tarda en *digerir* el prompt (system + historial + contexto RAG) antes de escupir el primer token. Crece con la longitud del prompt. En contextos RAG largos (1–2K tokens) puede pesar bastante. *Ojo:* con un modelo recién cargado, el TTFT del primer request **también incluye la carga del modelo a VRAM/RAM** (segundos a decenas de segundos) — por eso conviene tener el modelo precargado y con un `--ttl` alto.
+- **Generación:** los tokens de respuesta salen a un ritmo de `tokens_por_segundo` (tok/s), que depende casi todo del **hardware + tamaño del modelo + cuantización**.
+
+Y el throughput **agregado** (lo que importa para "cuántos usuarios"):
+
+```
+throughput_agregado = depende de si hay batching
+   • SIN batching (LM Studio en serie):  ≈ throughput de UNA request (la siguiente espera)
+   • CON batching (vLLM/llama.cpp/Ollama): suma muchas requests en paralelo en la misma GPU
+```
+
+Términos que vas a ver en las tablas:
+
+> **Throughput:** cuánto trabajo despacha el sistema por unidad de tiempo. Se mide en **tokens/seg** (a nivel motor) o en **consultas/min** (a nivel servicio).
+>
+> **Tokens/seg (tok/s):** velocidad de generación. La métrica reina del rendimiento de inferencia. "Generación" (decode) y "prompt processing" (prefill) tienen tok/s distintos; el prefill suele ser más rápido por token.
+>
+> **Latencia p50 / p95:** tiempo de respuesta. El **p50** (mediana) es el caso típico; el **p95** es "el 95% de las requests tardan menos que esto". En sistemas en serie, cuando se forma cola **el p95 se dispara** aunque el p50 se vea bien — es la trampa clásica de medir solo el promedio.
+>
+> **Concurrencia:** cuántas requests se están procesando **al mismo tiempo**. En LM Studio crudo ≈ 1. Con batching, decenas o cientos.
+>
+> **RPS / RPM / QPS:** *requests (o queries) per second / per minute*. La tasa de llegada de consultas. `RPM = RPS × 60`. "QPS" y "RPS" son lo mismo acá.
+
+#### Supuestos explícitos (leelos antes de creerte las tablas)
+
+Los números de abajo son **estimaciones de orden de magnitud**, NO benchmarks que corrí en tu máquina. Sirven para dimensionar y discutir, no para un SLA. Dependen muchísimo del hardware exacto, la cuantización, el largo del contexto y la versión del runtime. **Medí en tu hardware con `lms log stream` o un script de carga antes de comprometer nada.**
+
+Supuestos usados:
+
+| Supuesto | Valor asumido |
+|---|---|
+| **Longitud media de respuesta** | **400 tokens** (rango 300–500). |
+| **Prompt + contexto** | **~1.5K tokens** (system + historial corto + 2–4 chunks de RAG). |
+| **Cuantización** | **Q4_K_M** en todos los modelos. |
+| **TTFT** | absorbido dentro de la latencia (estimado por el prefill del prompt de ~1.5K tok). |
+| **Modo serie (LM Studio)** | 1 instancia procesa 1 request por vez; el resto espera. |
+| **Modo batching (vLLM/llama.cpp/Ollama)** | varias requests comparten la GPU; el tok/s **por request** baja un poco, pero el **agregado** sube fuerte. |
+| **Latencia objetivo para "usuarios concurrentes razonables"** | que el usuario empiece a ver respuesta rápido (streaming) y la latencia p95 se mantenga **tolerable (≲ 15–20 s)** bajo carga. |
+| **"Consultas/día"** | extrapolación lineal de las consultas/min asumiendo uso sostenido; en la práctica el tráfico es a ráfagas, así que tomalo como **techo teórico**, no como demanda real. |
+
+#### Tabla principal — capacidad por hardware × modelo
+
+> Lee las columnas así: **tok/s** = velocidad de generación; **latencia/consulta** = para una respuesta media de 400 tok con prompt de ~1.5K; **consultas/min (serie)** = lo que despacha **1 sola instancia en serie**; **usuarios concurrentes razonables** = cuántos usuarios *activos a la vez* tolera manteniendo el p95 aceptable; **consultas/día** = techo teórico con uso sostenido.
+
+| # | Hardware | Modelo | tok/s aprox. (gen.) | Latencia/consulta (~400 tok) | Consultas/min (1 instancia, **serie**) | Usuarios concurrentes razonables | Consultas/día (techo) | Modo |
+|---|---|---|---|---|---|---|---|---|
+| 1 | **CPU-only** (imagen `llmster-preview:cpu`, x86, sin GPU) | Llama 3.2 **3B** | ~8–15 | ~30–55 s | ~1–2 | **1** (uso esporádico) | ~1.5–3 K | 🐌 **serie** |
+| 2 | **CPU-only** (misma imagen) | Qwen3 **8B** | ~3–7 | ~60–130 s | ~0.5–1 | **1** (apenas) | ~700–1.5 K | 🐌 **serie** |
+| 3 | **GPU media** (RTX 4090 / 24 GB) | gpt-oss-**20b** (MoE) | ~50–90 | ~5–9 s | ~7–12 | **3–6** | ~10–17 K | **serie** (LM Studio) |
+| 4 | **GPU media** (RTX 4090 / 24 GB) | Qwen3 **30B-A3B** (MoE) | ~120–190 | ~3–5 s | ~12–20 | **5–10** | ~17–28 K | **serie** (LM Studio) |
+| 5 | **GPU media** (RTX 4090 / 24 GB) | Qwen3 **8B** denso | ~90–110 | ~4–6 s | ~10–15 | **4–8** | ~14–22 K | **serie** (LM Studio) |
+| 6 | **GPU alta / server** (A100 80 GB / H100, 1×) | Llama 3.3 **70B** Q4 | ~30–45 (por request) | ~10–15 s | ~4–6 | **2–4** | ~6–9 K | **serie** (LM Studio) |
+| 7 | **GPU alta / server** (A100/H100) **con batching** | Qwen3 8B / gpt-oss-20b | **agregado: cientos–miles tok/s** | ~5–10 s/req (estable) | **~60–200+** | **50–250+** | **cientos de miles** | 🚀 **batching** (vLLM/llama.cpp) |
+| 8 | **GPU server multi-GPU** (4× A100) **con batching** | Llama 70B Q4/FP8 | **agregado ~2.000+ tok/s** | ~10–20 s/req bajo carga | **~80–150** | **~100–256** | **cientos de miles** | 🚀 **batching** (vLLM) |
+
+**Cómo leer la diferencia clave:** las filas **1–6 asumen LM Studio en serie** — la columna "usuarios concurrentes razonables" NO significa que LM Studio atienda esos N en paralelo, sino cuántos usuarios *activos* podés tener **detrás de una cola** antes de que la espera p95 se vuelva intolerable (porque cada uno consume ~latencia/consulta de tiempo de servicio). Las filas **7–8 asumen un motor con continuous batching**: ahí sí hay concurrencia real dentro de la GPU, y por eso el salto de capacidad es de uno o dos órdenes de magnitud.
+
+> 💡 **Por qué los MoE rompen la tabla a su favor:** *gpt-oss-20b* y *Qwen3 30B-A3B* activan solo ~3B de params por token, así que generan a velocidad de un modelo chico pero responden con calidad de uno grande. Para un escenario de producción con GPU media son, casi siempre, **el mejor punto de equilibrio velocidad/calidad/concurrencia**.
+
+> 🐌 **Por qué la fila CPU es tan floja:** la imagen Docker oficial es **CPU-only preview** ([§10](#10-dockerizar--despliegue-headless)). Sin GPU, un 8B se arrastra a pocos tok/s y una sola respuesta puede tardar **uno o dos minutos**. Sirve para dev/CI o un bot interno de bajísimo tráfico — **no** para servir usuarios concurrentes. Para producción con concurrencia: GPU + (idealmente) un motor con batching.
+
+#### Cómo escalar la concurrencia (las palancas)
+
+Como una instancia de LM Studio ≈ 1 request a la vez, subir concurrencia es **arquitectura alrededor del modelo**, no un flag mágico:
+
+| Palanca | Qué hace | Cuánto sube la concurrencia | Costo / contra |
+|---|---|---|---|
+| **Cola + worker con backpressure** delante de LM Studio | Encolás requests y las despachás de a una; rechazás/diferís cuando la cola se llena. | No sube el throughput, pero **evita el colapso** y te da un p95 predecible. | El usuario espera en cola; necesitás UX de "procesando…". |
+| **N réplicas del contenedor + balanceador** | N instancias = **N requests en paralelo**. Round-robin / least-connections adelante. | **×N lineal** (con N GPUs o N slots de CPU). | N× hardware/VRAM; cada réplica carga su copia del modelo. |
+| **Migrar a motor con continuous batching** (vLLM, llama.cpp `--parallel`, Ollama `OLLAMA_NUM_PARALLEL`) | Mete varias requests en el mismo paso de GPU. | **Decenas a cientos** en una sola GPU (la vía más eficiente en hardware). | Salís de LM Studio para servir; más tuning. (Seguís usándolo para dev — siguen siendo OpenAI-compatible.) |
+| **Modelo más chico / MoE** | Menos cómputo por token → más tok/s → cada request libera el slot antes. | Sube RPM por instancia (efecto multiplicador sobre todo lo demás). | Algo menos de calidad (mitigable con buen RAG/prompting). |
+| **Limitar `max_tokens`** | Acotás la respuesta (p. ej. 300 en vez de 800). | Baja la latencia/consulta → más RPM. | Respuestas más cortas; cuidá no truncar lo útil. |
+| **Cache de respuestas / embeddings** | Reusás resultados de prompts repetidos y embeddings ya calculados (RAG). | Las requests cacheadas cuestan ~0 → "concurrencia gratis" en lo repetido. | Solo ayuda si hay repetición; invalidación a tu cargo. |
+
+Fórmula simple para combinar las dos palancas de escala horizontal:
+
+```
+usuarios_soportados ≈ (RPM_por_instancia × instancias) ÷ RPM_por_usuario
+```
+
+Donde `RPM_por_instancia` lo sacás de la tabla principal (columna "consultas/min, serie") y `RPM_por_usuario` es cuántas consultas hace un usuario activo por minuto (ojo: un usuario "interactivo" rara vez supera **1–2 consultas/min**, porque también lee y piensa).
+
+#### Regla práctica de dimensionamiento
+
+El insumo que vas a tener del negocio suele ser: **"espero X usuarios activos que hacen Y consultas/hora"**. Convertilo y compará contra una instancia:
+
+```
+1) Demanda pico (RPM) ≈ X_usuarios_activos × (Y_consultas_hora ÷ 60) × factor_pico
+        (usá factor_pico ≈ 2–3: el tráfico no es uniforme, llega a ráfagas)
+
+2) Capacidad de 1 instancia (RPM) = de la tabla principal (col. "consultas/min, serie")
+
+3) Instancias ≈ ceil( Demanda_pico_RPM ÷ Capacidad_por_instancia_RPM )
+        Si "Instancias" empieza a ser grande (≳ 4–6) → migrá a batching en vez de apilar réplicas.
+```
+
+**Ejemplo A — Equipo interno chico (lo que más te va a tocar).** *"20 usuarios internos, consultas esporádicas, ~3 consultas/hora cada uno."*
+
+- Demanda media = 20 × (3 ÷ 60) = **1 RPM**. Con factor pico ×3 ≈ **3 RPM**.
+- 1 RTX 4090 con **Qwen3 30B-A3B** (fila 4) da **~12–20 RPM**.
+- **Veredicto:** **1 sola instancia GPU media alcanza y sobra.** Ni hace falta batching. Poné una **cola simple** por si dos personas mandan justo al mismo tiempo, y listo. (Si todo es CPU-only, sería ajustado pero usable para uso tan esporádico — con paciencia.)
+
+**Ejemplo B — Chatbot de soporte de tráfico medio.** *"~150 usuarios concurrentes en hora pico, 1 consulta/min cada uno."*
+
+- Demanda pico ≈ 150 × 1 = **150 RPM**.
+- 1 RTX 4090 con gpt-oss-20b en serie (fila 3) da **~7–12 RPM** → harían falta **~13–20 réplicas en serie**. Inviable por costo.
+- **Veredicto:** **migrá a continuous batching.** Una o dos GPUs con **vLLM** sirviendo un 8B/20B (fila 7) absorben 150 RPM cómodas con buena latencia. Acá LM Studio en serie ya no es la herramienta; usalo para *desarrollar* y desplegá con vLLM/llama.cpp server (que siguen siendo OpenAI-compatible, así que **tu código .NET no cambia** — solo el `Endpoint`).
+
+**Ejemplo C — API pública de alto volumen.** *"API pública, objetivo 1000 req/min sostenidas."*
+
+- Demanda = **1000 RPM** sostenidas (≈ 17 RPS).
+- Imposible en serie (serían **~80–140 instancias** de LM Studio).
+- **Veredicto:** **batching obligatorio + escalado horizontal.** vLLM con continuous batching en GPUs server (A100/H100), **N réplicas detrás de un balanceador** (fila 7/8), autoscaling por profundidad de cola, cache de respuestas/embeddings para lo repetido, y `max_tokens` acotado. LM Studio queda **fuera del path de producción** (no fue diseñado para esto); su lugar es el laboratorio donde prototipás y validás el modelo/prompt antes de portarlo al motor de serving.
+
+> **La síntesis honesta:** LM Studio es ideal para **desarrollar, prototipar y servir poquitos usuarios internos con GPU**. Para concurrencia real (decenas/cientos de usuarios o una API pública) la respuesta no es "afinar LM Studio", es **poner una cola + réplicas** o, mejor, **mover el serving a un motor con continuous batching**. Como todos son OpenAI-compatible, el salto te cuesta cambiar una URL, no reescribir la app .NET.
+
+*Fuentes (cifras de throughput como referencia de orden de magnitud, verificadas 2026-06-14): [Home GPU LLM Leaderboard](https://awesomeagents.ai/leaderboards/home-gpu-llm-leaderboard/), [hardware-corner GPU ranking for local LLMs](https://www.hardware-corner.net/gpu-ranking-local-llm/), [SitePoint M3 Max vs RTX 4090 (2026)](https://www.sitepoint.com/mac-m3-max-vs-rtx-4090-local-llm-performance-showdown-2026/), [vLLM PagedAttention & continuous batching (RunPod)](https://www.runpod.io/articles/guides/vllm-pagedattention-continuous-batching), [vLLM throughput guide 2026](https://blog.easecloud.io/ai-cloud/increase-throughput-with-vllm-serving/).*
+
+### 11.7 Cómo armarlo de punta a punta
+
+1. **Elegí el camino** según hardware: A (`llmster-preview:cpu`) para CPU/CI/preview, o B (`llama-server`/Ollama con CUDA) si tenés GPU. *(§11.2)*
+2. **Elegí modelo + cuantización + context-length** con la tabla de §11.4 y validá memoria con `lms load --estimate-only` (o el cálculo de la [§4](#4-cómo-elegir-el-modelo-según-el-hardware)).
+3. **Escribí el `Dockerfile`** extendiendo la base, decidiendo **bakeado vs volumen** para el modelo, y el **`entrypoint.sh`** (`lms server start --cors` → esperar `/v1/models` → `lms get` → `lms load`). *(§11.3)*
+4. **Agregá el `HEALTHCHECK`** (`curl` a `/v1/models`) con `start-period` largo, para que el orquestador no rote tráfico antes de que el modelo esté cargado.
+5. **Definí el `docker-compose`** con los tres contenedores: runtime, vector store (Qdrant/pgvector) y el job de **ingesta**; seteá `mem_limit`/`cpus` (y `--gpus all` en camino B) y los **volúmenes** persistentes. *(§11.4)*
+6. **Buildeá y levantá:** `docker compose build && docker compose up -d`. Verificá: `curl http://localhost:1234/v1/models` debe listar tus modelos.
+7. **Corré la ingesta una vez** para indexar tus documentos en el vector store (chunking → `/v1/embeddings` → upsert). El detalle paso a paso de la KB está en §11.5.
+8. **Apuntá tu app .NET** al runtime cambiando solo `Endpoint` en `appsettings.json` (camino A: `…:1234/v1`; B: `…:8080/v1` o `…:11434/v1`). El resto del código de la [§9](#9-consumir-el-modelo-local-desde-net) queda igual.
+9. **Poné un reverse proxy** (nginx/Caddy/Traefik) delante con **TLS + auth + rate-limit** antes de exponer fuera de la red interna.
+10. **Dimensioná** la cantidad de instancias/hardware con la tabla y la regla de §11.6 según los usuarios/consultas que esperás.
+
+> 🔒 **Seguridad (no negociable):** el runtime **no trae autenticación por defecto** y bindea `127.0.0.1`. Si lo exponés en red (`--bind 0.0.0.0` o publicando el puerto), **activá los API tokens** (Developer Page → Server Settings, opcionales desde 0.4.0) y mandá `Authorization: Bearer <token>` desde .NET. Sin auth, cualquiera en la red usa tu modelo. Lo más seguro: **no publicar el puerto del runtime**, dejarlo solo en la red interna de Docker, y exponer únicamente el **reverse proxy** con TLS y autenticación propia. Y si conectás MCP, recordá la advertencia de la [§8](#8-integración-con-mcp-model-context-protocol): los servidores MCP pueden ejecutar código arbitrario.
+
+*Fuentes: [lmstudio-vs-llmster-vs-lms](https://lmstudio.ai/docs/app/basics/lmstudio-vs-llmster-vs-lms), [headless_llmster](https://lmstudio.ai/docs/developer/core/headless_llmster), [hub.docker.com/r/lmstudio/llmster-preview](https://hub.docker.com/r/lmstudio/llmster-preview), [cli/server-start](https://lmstudio.ai/docs/cli/server-start), [authentication](https://lmstudio.ai/docs/developer/core/authentication), [ollama docker](https://docs.ollama.com/docker), [llama.cpp docker](https://github.com/ggml-org/llama.cpp/blob/master/docs/docker.md).*
+
+---
+
+## 12. Resumen y ruta de aprendizaje recomendada
 
 Checklist progresivo para llegar de cero a un chatbot .NET con RAG y herramientas:
 
@@ -980,6 +1622,7 @@ Checklist progresivo para llegar de cero a un chatbot .NET con RAG y herramienta
 - [ ] **5. RAG:** empezá con el document chat integrado; después armá tu RAG propio con `/v1/embeddings` + un vector store. *(§7)*
 - [ ] **6. MCP:** agregá un servidor MCP vía `mcp.json` para darle herramientas al modelo (cuidado con la seguridad). *(§8)*
 - [ ] **7. Headless/Docker:** cuando funcione local, evaluá `llmster`/Docker para CPU/CI, o Ollama/llama.cpp si necesitás GPU en producción. *(§10)*
+- [ ] **8. Producción:** armá el stack dockerizado (runtime + vector store + ingesta), prepará, persistí y *seedeá* la KB, asegurá con reverse proxy/API tokens y dimensioná usuarios/consultas. *(§11)*
 
 ---
 
